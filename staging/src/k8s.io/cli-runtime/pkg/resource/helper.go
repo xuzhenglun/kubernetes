@@ -23,6 +23,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	clientfeatures "k8s.io/client-go/features"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -106,6 +109,29 @@ func (m *Helper) Get(namespace, name string) (runtime.Object, error) {
 }
 
 func (m *Helper) List(namespace, apiVersion string, options *metav1.ListOptions) (runtime.Object, error) {
+	// WatchList is disabled by default
+	if clientfeatures.FeatureGates().Enabled(clientfeatures.WatchListClient) {
+
+		options.Watch = true
+		options.ResourceVersion = "" // request latest version
+		options.SendInitialEvents = ptr.To(true)
+		options.ResourceVersionMatch = metav1.ResourceVersionMatchNotOlderThan
+		options.AllowWatchBookmarks = true
+		options.Limit = 0
+
+		result := unstructured.Unstructured{}
+		err := m.RESTClient.Get().
+			NamespaceIfScoped(namespace, m.NamespaceScoped).
+			Resource(m.Resource).
+			VersionedParams(options, metav1.ParameterCodec).
+			WatchList(context.TODO()).
+			Into(&result)
+
+		if err == nil {
+			return &result, nil
+		}
+	}
+
 	req := m.RESTClient.Get().
 		NamespaceIfScoped(namespace, m.NamespaceScoped).
 		Resource(m.Resource).
