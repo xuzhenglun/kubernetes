@@ -342,7 +342,11 @@ type Cacher struct {
 	// expiredBookmarkWatchers is a list of watchers that were expired and need to be schedule for a next bookmark event
 	expiredBookmarkWatchers []*cacheWatcher
 	compactor               *compactor
-	watcherMetrics          *metrics.WatcherMetricsObservers
+
+	watcherMetrics *metrics.WatcherMetricsObservers
+
+	// objectPool shares cachingObject wrappers across watchers replaying objects.
+	objectPool *cachingObjectPool
 }
 
 // NewCacherFromConfig creates a new Cacher responsible for servicing WATCH and LIST requests from
@@ -416,6 +420,7 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 		timer:            time.NewTimer(time.Duration(0)),
 		bookmarkWatchers: newTimeBucketWatchers(config.Clock, defaultBookmarkFrequency),
 		watcherMetrics:   metrics.NewWatcherMetricsObservers(config.GroupResource),
+		objectPool:       newCachingObjectPool(config.GroupResource),
 	}
 
 	// Ensure that timer is stopped.
@@ -469,6 +474,7 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 	}
 
 	go cacher.dispatchEvents()
+	go cacher.objectPool.run(stopCh)
 	go progressRequester.Run(stopCh)
 
 	cacher.stopWg.Add(1)
@@ -489,6 +495,7 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 func (c *Cacher) startCaching(stopChannel <-chan struct{}) {
 	startTime := time.Now()
 	c.watchCache.SetOnReplace(func() {
+		c.objectPool.purge()
 		c.ready.setReady()
 		duration := time.Since(startTime)
 		klog.V(1).InfoS("cacher initialized", "group", c.groupResource.Group, "resource", c.groupResource.Resource, "duration", duration)
@@ -610,6 +617,7 @@ func (c *Cacher) Watch(ctx context.Context, key string, opts storage.ListOptions
 		c.clock,
 		identifier,
 	)
+	watcher.objectPool = c.objectPool
 
 	// note that c.waitUntilWatchCacheFreshAndForceAllEvents must be called without
 	// the c.watchCache.RLock held otherwise we are at risk of a deadlock
@@ -970,10 +978,15 @@ func (c *Cacher) dispatchEvents() {
 	}
 }
 
-func setCachingObjects(event *watchCacheEvent, versioner storage.Versioner) {
+func setCachingObjects(pool *cachingObjectPool, event *watchCacheEvent, versioner storage.Versioner) {
 	switch event.Type {
 	case watch.Added, watch.Modified:
-		if object, err := newCachingObject(event.Object); err == nil {
+		object, err := pool.newCachingObject(event.Object)
+		if err != nil {
+			// Objects that can't be shared through the pool still get a private wrapper.
+			object, err = newCachingObject(event.Object)
+		}
+		if err == nil {
 			event.Object = object
 		} else {
 			klog.Errorf("couldn't create cachingObject from: %#v", event.Object)
@@ -1028,7 +1041,7 @@ func (c *Cacher) dispatchEvent(event *watchCacheEvent) {
 		//
 		// Make a shallow copy to allow overwriting Object and PrevObject.
 		wcEvent := *event
-		setCachingObjects(&wcEvent, c.versioner)
+		setCachingObjects(c.objectPool, &wcEvent, c.versioner)
 		wcEvent.timeline.MarkAt(metrics.PointWatcherEnqueued, c.clock.Now())
 		event = &wcEvent
 

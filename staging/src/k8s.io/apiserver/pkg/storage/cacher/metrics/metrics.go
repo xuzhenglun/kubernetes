@@ -157,6 +157,18 @@ var (
 		[]string{"group", "resource"},
 	)
 
+	// CachingObjectPoolLookups counts cachingObject pool lookups by outcome.
+	CachingObjectPoolLookups = compbasemetrics.NewCounterVec(
+		&compbasemetrics.CounterOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "caching_object_pool_lookups_total",
+			Help:           "Counter of cachingObject pool lookups broken by resource type and result (hit or miss).",
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"group", "resource", "result"},
+	)
+
 	TerminatedWatchersCounter = compbasemetrics.NewCounterVec(
 		&compbasemetrics.CounterOpts{
 			Namespace:      namespace,
@@ -313,6 +325,7 @@ func Register() {
 		legacyregistry.MustRegister(EventsReceivedCounter)
 		legacyregistry.MustRegister(EventsCounter)
 		legacyregistry.MustRegister(TerminatedWatchersCounter)
+		legacyregistry.MustRegister(CachingObjectPoolLookups)
 		legacyregistry.MustRegister(watchCacheResourceVersion)
 		legacyregistry.MustRegister(watchCacheCapacityIncreaseTotal)
 		legacyregistry.MustRegister(watchCacheCapacityDecreaseTotal)

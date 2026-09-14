@@ -89,6 +89,9 @@ type cacheWatcher struct {
 
 	// state holds a numeric value indicating the current state of the watcher
 	state int
+
+	// objectPool shares cachingObject wrappers for replayed objects; nil falls back to deep-copy.
+	objectPool *cachingObjectPool
 }
 
 func newCacheWatcher(
@@ -354,12 +357,17 @@ func (c *cacheWatcher) isDoneChannelClosedLocked() bool {
 	return false
 }
 
-func getMutableObject(object runtime.Object) runtime.Object {
+func getMutableObject(pool *cachingObjectPool, object runtime.Object) runtime.Object {
 	if _, ok := object.(*cachingObject); ok {
 		// It is safe to return without deep-copy, because the underlying
 		// object will lazily perform deep-copy on the first try to change
 		// any of its fields.
 		return object
+	}
+	if pool != nil {
+		if cached, err := pool.newCachingObject(object); err == nil {
+			return cached
+		}
 	}
 	return object.DeepCopyObject()
 }
@@ -394,12 +402,12 @@ func (c *cacheWatcher) convertToWatchEvent(event *watchCacheEvent) *watch.Event 
 
 	switch {
 	case curObjPasses && !oldObjPasses:
-		return &watch.Event{Type: watch.Added, Object: getMutableObject(event.Object)}
+		return &watch.Event{Type: watch.Added, Object: getMutableObject(c.objectPool, event.Object)}
 	case curObjPasses && oldObjPasses:
-		return &watch.Event{Type: watch.Modified, Object: getMutableObject(event.Object)}
+		return &watch.Event{Type: watch.Modified, Object: getMutableObject(c.objectPool, event.Object)}
 	case !curObjPasses && oldObjPasses:
 		// return a delete event with the previous object content, but with the event's resource version
-		oldObj := getMutableObject(event.PrevObject)
+		oldObj := getMutableObject(nil, event.PrevObject)
 		// We know that if oldObj is cachingObject (which can only be set via
 		// setCachingObjects), its resourceVersion is already set correctly and
 		// we don't need to update it. However, since cachingObject efficiently

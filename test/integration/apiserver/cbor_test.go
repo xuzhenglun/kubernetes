@@ -67,12 +67,28 @@ func TestNondeterministicResponseEncoding(t *testing.T) {
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsAllowCBOR, true)
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsPreferCBOR, true)
 
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	// The watch cache shares one serialization per object across the watchers replaying it,
+	// including across consecutive watch requests to the same apiserver, so a single instance
+	// may legitimately return byte-identical encodings of the same watch event. Encoding
+	// nondeterminism is therefore asserted across two independent apiserver instances backed
+	// by the same etcd: their encoders share no caches and each process has its own map
+	// iteration seed.
+	etcdConfig := framework.SharedEtcd()
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), etcdConfig)
 	t.Cleanup(server.TearDownFn)
+	server2 := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), etcdConfig)
+	t.Cleanup(server2.TearDownFn)
 
 	config := rest.CopyConfig(server.ClientConfig)
 	config.AcceptContentTypes = "application/cbor"
 	client, err := corev1client.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config2 := rest.CopyConfig(server2.ClientConfig)
+	config2.AcceptContentTypes = "application/cbor"
+	client2, err := corev1client.NewForConfig(config2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,14 +162,12 @@ func TestNondeterministicResponseEncoding(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		request := client.RESTClient().Get().Resource("namespaces")
-
 		// Get the raw bytes of the watch event induced by the patch plus the raw bytes of
-		// its embedded object.
-		getRawEventAndRawObject := func() ([]byte, []byte, error) {
+		// its embedded object, as served by the given apiserver instance.
+		getRawEventAndRawObject := func(c *corev1client.CoreV1Client) ([]byte, []byte, error) {
 			ctx, cancel := context.WithTimeout(context.TODO(), 6*time.Second)
 			defer cancel()
-			rc, err := request.
+			rc, err := c.RESTClient().Get().Resource("namespaces").
 				VersionedParams(&metav1.ListOptions{
 					ResourceVersion: namespace.ResourceVersion,
 					Watch:           true,
@@ -200,7 +214,7 @@ func TestNondeterministicResponseEncoding(t *testing.T) {
 			}
 		}
 
-		event1, raw1, err := getRawEventAndRawObject()
+		event1, raw1, err := getRawEventAndRawObject(client)
 		if err != nil {
 			if apierrors.IsResourceExpired(err) {
 				t.Logf("retrying: %v", err)
@@ -213,7 +227,7 @@ func TestNondeterministicResponseEncoding(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		event2, raw2, err := getRawEventAndRawObject()
+		event2, raw2, err := getRawEventAndRawObject(client2)
 		if err != nil {
 			if apierrors.IsResourceExpired(err) {
 				t.Logf("retrying: %v", err)
@@ -244,10 +258,10 @@ func TestNondeterministicResponseEncoding(t *testing.T) {
 		}
 	}
 	if !eventDiff {
-		t.Errorf("watch event encoded identically over %d consecutive watch requests", NTrials)
+		t.Errorf("watch event encoded identically across two apiserver instances over %d trials", NTrials)
 	}
 	if !objDiff {
-		t.Errorf("watch event embedded object encoded identically over %d consecutive watch requests", NTrials)
+		t.Errorf("watch event embedded object encoded identically across two apiserver instances over %d trials", NTrials)
 	}
 }
 

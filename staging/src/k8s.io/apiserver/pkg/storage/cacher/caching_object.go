@@ -30,6 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/storage/cacher/metrics"
+	compbasemetrics "k8s.io/component-base/metrics"
 	"k8s.io/klog/v2"
 )
 
@@ -409,4 +412,125 @@ func (o *cachingObject) SetManagedFields(managedFields []metav1.ManagedFieldsEnt
 		func() bool { return reflect.DeepEqual(o.object.GetManagedFields(), managedFields) },
 		func() { o.object.SetManagedFields(managedFields) },
 	)
+}
+
+// cachingObjectPoolTTL is how long an unused wrapper is kept before its serializations are released.
+const cachingObjectPoolTTL = 15 * time.Second
+
+// cachingObjectPool shares cachingObject wrappers across watchers replaying the same object.
+//
+// Wrappers live in two generations that are rotated every ttl: a lookup checks
+// the current generation and then the previous one, a new wrapper is stored in
+// the current one, and a rotation drops the previous generation wholesale. A
+// wrapper is therefore shared for at least ttl and released within 2*ttl with
+// no per-entry expiry bookkeeping, and the fast path takes no lock.
+type cachingObjectPool struct {
+	groupResource schema.GroupResource
+	ttl           time.Duration
+
+	generations atomic.Pointer[cachingObjectGenerations]
+
+	// lookupCounters caches the resolved hit and miss counters once the metric
+	// is registered: resolving them per lookup takes the vec's locks.
+	lookupCounters atomic.Pointer[[2]compbasemetrics.CounterMetric]
+}
+
+// cachingObjectGenerations is the immutable pair of maps a lookup sees at once.
+type cachingObjectGenerations struct {
+	current  *sync.Map // cachingObjectKey -> *cachingObject
+	previous *sync.Map
+}
+
+type cachingObjectKey struct {
+	uid             types.UID
+	resourceVersion string
+}
+
+func newCachingObjectPool(groupResource schema.GroupResource) *cachingObjectPool {
+	c := &cachingObjectPool{
+		groupResource: groupResource,
+		ttl:           cachingObjectPoolTTL,
+	}
+	c.purge()
+	return c
+}
+
+// run rotates the generations every ttl until stopCh is closed.
+func (c *cachingObjectPool) run(stopCh <-chan struct{}) {
+	wait.Until(c.rotate, c.ttl, stopCh)
+}
+
+// rotate drops the previous generation and starts an empty current one.
+func (c *cachingObjectPool) rotate() {
+	for {
+		old := c.generations.Load()
+		next := &cachingObjectGenerations{current: &sync.Map{}, previous: old.current}
+		if c.generations.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// purge drops every cached wrapper.
+func (c *cachingObjectPool) purge() {
+	c.generations.Store(&cachingObjectGenerations{current: &sync.Map{}, previous: &sync.Map{}})
+}
+
+// newCachingObject returns the wrapper shared by all callers passing the same object, creating it on first use.
+func (c *cachingObjectPool) newCachingObject(object runtime.Object) (*cachingObject, error) {
+	// no pool: default code path
+	if c == nil {
+		return newCachingObject(object)
+	}
+
+	obj, ok := object.(metaRuntimeInterface)
+	if !ok {
+		return nil, fmt.Errorf("can't cast object to metav1.Object: %#v", object)
+	}
+	key := cachingObjectKey{uid: obj.GetUID(), resourceVersion: obj.GetResourceVersion()}
+	if key.uid == "" || key.resourceVersion == "" {
+		return nil, fmt.Errorf("object without uid or resourceVersion can't be shared: %#v", object)
+	}
+
+	generations := c.generations.Load()
+	if v, ok := generations.current.Load(key); ok {
+		c.recordLookup("hit")
+		return v.(*cachingObject), nil
+	}
+	if v, ok := generations.previous.Load(key); ok {
+		c.recordLookup("hit")
+		return v.(*cachingObject), nil
+	}
+
+	ret, err := newCachingObject(obj)
+	if err != nil {
+		return nil, err
+	}
+	// A concurrent miss for the same key may have stored its wrapper first; share that one.
+	if actual, loaded := generations.current.LoadOrStore(key, ret); loaded {
+		c.recordLookup("hit")
+		return actual.(*cachingObject), nil
+	}
+	c.recordLookup("miss")
+	return ret, nil
+}
+
+func (c *cachingObjectPool) recordLookup(result string) {
+	counters := c.lookupCounters.Load()
+	if counters == nil {
+		if !metrics.CachingObjectPoolLookups.IsCreated() {
+			// Not registered yet: the vec would drop the sample anyway.
+			return
+		}
+		counters = &[2]compbasemetrics.CounterMetric{
+			metrics.CachingObjectPoolLookups.WithLabelValues(c.groupResource.Group, c.groupResource.Resource, "hit"),
+			metrics.CachingObjectPoolLookups.WithLabelValues(c.groupResource.Group, c.groupResource.Resource, "miss"),
+		}
+		c.lookupCounters.Store(counters)
+	}
+	if result == "hit" {
+		counters[0].Inc()
+	} else {
+		counters[1].Inc()
+	}
 }

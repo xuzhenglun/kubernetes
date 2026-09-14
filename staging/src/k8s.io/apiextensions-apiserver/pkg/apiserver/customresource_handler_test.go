@@ -630,7 +630,13 @@ func testHandlerConversion(t *testing.T, enableWatchCache bool) {
 				if !ok {
 					t.Fatalf("watch closed")
 				}
-				item, isUnstructured := event.Object.(*unstructured.Unstructured)
+
+				eventObject := event.Object
+				if cacheObject, ok := event.Object.(runtime.CacheableObject); ok {
+					eventObject = cacheObject.GetObject()
+				}
+
+				item, isUnstructured := eventObject.(*unstructured.Unstructured)
 				if !isUnstructured {
 					t.Fatalf("unexpected object type %T: %#v", item, event)
 				}
